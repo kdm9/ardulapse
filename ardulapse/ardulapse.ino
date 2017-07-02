@@ -10,7 +10,7 @@
 
 #define CS_PIN_SD       4  // SD
 #define CS_PIN_CAMERA   10 // CAM
-#define BUFFER_SIZE     256
+#define BUFFER_SIZE     512
 
 ArduCAM CAM(OV5642, CS_PIN_CAMERA);
 
