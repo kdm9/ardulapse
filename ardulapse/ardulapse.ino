@@ -1,12 +1,47 @@
+// Copyright (c) 2017 Kevin Murray <kdmfoss@gmail.com>:w
+//
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+
 #include <ArduCAM.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
 #include "memorysaver.h"
 
+#define DELAY_MSEC  10000
 #define PIN_CS_SD   4
 #define PIN_CS_CAM  7
 #define SERIAL_SPD  115200
+// #define POWERSAVE
+#define PROPER_JPEG
+#define NAME_BY_SERIES
+
+#define FNAME_BUFSIZE 32
+#define IMG_BUFSIZE 256
+
+/* WIRING:
+Camera:
+SCL, SDA -> SCL, SDA
+MOSI, MISO, SCK -> 11, 12, 13
+CS -> PIN_CS_CAM
+
+SD card:
+MOSI, MISO, SCK -> 11, 12, 13
+CS -> PIN_CS_SD
+*/
+
+
+#ifdef POWERSAVE
+#define PWRDOWN(m) m.set_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK)
+#define PWRUP(m) m.clear_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK)
+#else
+#define PWRDOWN(m) while(0)
+#define PWRUP(m) while(0)
+#endif
+
 
 ArduCAM myCAM(OV5642, PIN_CS_CAM);
 
@@ -18,6 +53,7 @@ void setup()
     Serial.println(F("ArduCAM Start!"));
     //set the CS as an output:
     pinMode(PIN_CS_CAM, OUTPUT);
+    pinMode(PIN_CS_SD, OUTPUT);
 
     // initialize SPI:
     SPI.begin();
@@ -59,95 +95,117 @@ void setup()
     myCAM.InitCAM();
     myCAM.write_reg(ARDUCHIP_TIM, VSYNC_LEVEL_MASK);   //VSYNC is active HIGH
     myCAM.OV5642_set_JPEG_size(OV5642_2592x1944);
+    //myCAM.OV5642_set_JPEG_size(OV5642_320x240);
     myCAM.write_reg(ARDUCHIP_FRAMES,0x00);
-    myCAM.set_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK);
-    delay(1000);
+    PWRDOWN(myCAM);
 }
+
+#ifdef NAME_BY_SERIES
+static uint32_t imgn = 0;
+#endif
 
 void loop()
 {
-    char filename[32];
-    byte buf[256];
-    static int i = 0;
-    static int k = 0;
-    uint8_t temp = 0,temp_last=0;
+    char filename[FNAME_BUFSIZE] = "";
+    byte buf[IMG_BUFSIZE];
+    uint32_t bufpos = 0;
+    uint32_t time_ms = millis();
     uint32_t length = 0;
-    bool is_header = false;
     File outFile;
-    myCAM.clear_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK);
-    //Flush the FIFO
-    myCAM.flush_fifo();
-    //Clear the capture done flag
+
+    Serial.print(F("\n\nBEGIN at "));
+    Serial.println(time_ms/1000, DEC);
+
+    // Turn on camera
+    PWRUP(myCAM);
     myCAM.clear_fifo_flag();
-    //Start capture
+
+    Serial.print(F("Start capture -- "));
+    // Prepare for capture
+    memset(buf, 0, IMG_BUFSIZE);
+    myCAM.flush_fifo();
+    // Capture
     myCAM.start_capture();
-    Serial.println(F("start Capture"));
-    // Wait for capture to finish
-    while(!myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK));
-    Serial.println(F("Capture Done."));
+    while (!myCAM.get_bit(ARDUCHIP_TRIG, CAP_DONE_MASK));
+    Serial.println(F("Done."));
+
     length = myCAM.read_fifo_length();
-    Serial.print(F("The fifo length is :"));
-    Serial.println(length, DEC);
+    Serial.print(F("The fifo length is "));
+    Serial.print(length, DEC);
     if (length >= MAX_FIFO_SIZE) { //384K
-        Serial.println(F("Over size."));
+        Serial.println(F(" -- Over size."));
+        return ;
+    } else if (length == 0 ) { //0 kb
+        Serial.println(F(" -- Size is 0."));
         return ;
     }
-    if (length == 0 ) { //0 kb
-        Serial.println(F("Size is 0."));
-        return ;
-    }
+    Serial.println(F(" -- OK"));
+
     //Construct a file name
-    k = k + 1;
-    itoa(k, filename, 10);
+#ifdef NAME_BY_SERIES
+    itoa(++imgn, filename, 10);
+#else
+    itoa((int)(time_ms / 1000), filename, 10);
+#endif
     strcat(filename, ".jpg");
+
     //Open the new file
+    Serial.print(F("Open "));
+    Serial.print(filename);
     outFile = SD.open(filename, O_WRITE | O_CREAT | O_TRUNC);
     if(!outFile) {
-        Serial.println(F("File open faild"));
+        Serial.println(F(" -- Failed"));
+        delay(1000);
         return;
     }
-    Serial.print(F("Saving to: "));
-    Serial.println(filename);
+    Serial.println(F(" -- OK"));
+
+    // Write image
+    Serial.print(F("Saving image -- "));
+    uint32_t remaining = length;
+    uint32_t wrote = 0;
+#ifdef PROPER_JPEG
+    // Find JPG header
     myCAM.CS_LOW();
     myCAM.set_fifo_burst();
-/*
-    while ( length-- ) {
-        temp_last = temp;
-        temp =  SPI.transfer(0x00);
-        //Read JPEG data from FIFO
-        if ( (temp == 0xD9) && (temp_last == 0xFF) ) { //If find the end ,break while,
-            buf[i++] = temp;  //save the last  0XD9
-            //Write the remain bytes in the buffer
-            myCAM.CS_HIGH();
-            outFile.write(buf, i);
-            //Close the file
-            outFile.close();
-            Serial.println(F("Image save OK."));
-            is_header = false;
-            i = 0;
-        }
-        if (is_header == true) {
-            //Write image data to buffer if not full
-            if (i < 256)
-                buf[i++] = temp;
-            else {
-                //Write 256 bytes image data to file
-                myCAM.CS_HIGH();
-                outFile.write(buf, 256);
-                i = 0;
-                buf[i++] = temp;
-                myCAM.CS_LOW();
-                myCAM.set_fifo_burst();
-            }
-        } else if ((temp == 0xD8) & (temp_last == 0xFF)) {
-            is_header = true;
-            buf[i++] = temp_last;
-            buf[i++] = temp;
-        }
+    while (remaining > 0) {
+        if (buf[0] == 0xFF && buf[1] == 0xD8) break;
+        buf[0] = buf[1];
+        buf[1] = SPI.transfer(0); remaining--;
+        bufpos = 2;
     }
-*/
-    myCAM.set_bit(ARDUCHIP_GPIO,GPIO_PWDN_MASK);
-    delay(10000);
+    if (remaining == 0) {
+        Serial.println("Invalid JPEG/JIF!");
+        return;
+    }
+#endif
+    while (remaining) {
+        myCAM.CS_LOW();
+        myCAM.set_fifo_burst();
+        while (bufpos < IMG_BUFSIZE && remaining > 0) {
+            buf[bufpos] =  SPI.transfer(0); remaining--;
+            #ifdef PROPER_JPEG
+            if (buf[bufpos-1] == 0xFF && buf[bufpos] == 0xD9) break;
+            #endif
+            bufpos++;
+        }
+        myCAM.CS_HIGH();
+        if (wrote % 1024 == 0) {
+            Serial.print(F("\033[1G\033[2KSaving image -- "));
+            Serial.print(wrote / 1024, DEC);
+            Serial.print(F("kb"));
+        }
+        wrote += bufpos;
+        outFile.write(buf, bufpos);
+        bufpos = 0;
+    }
+    outFile.close();
+    Serial.println(F("\033[1G\033[2KSaved sucessfully"));
+
+//    myCAM.clear_fifo_flag();
+//    myCAM.flush_fifo();
+    PWRDOWN(myCAM);
+
+    int32_t to_delay = DELAY_MSEC - (millis() - time_ms);
+    if (to_delay > 0) delay(to_delay);
 }
-
-
